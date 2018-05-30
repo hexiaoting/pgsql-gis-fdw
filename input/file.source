@@ -1,0 +1,106 @@
+
+CREATE EXTENSION ogr_fdw;
+
+CREATE SERVER myserver
+  FOREIGN DATA WRAPPER ogr_fdw
+  OPTIONS (
+    datasource '@abs_srcdir@/data',
+    format 'ESRI Shapefile' );
+
+------------------------------------------------
+
+CREATE FOREIGN TABLE pt_1 (
+  fid integer,
+  geom bytea,
+  name varchar,
+  age integer,
+  height real,
+  birthdate date )
+  SERVER myserver
+  OPTIONS ( layer 'pt_two' );
+
+SELECT * FROM pt_1 WHERE fid = 1;
+
+------------------------------------------------
+
+CREATE FOREIGN TABLE pt_2 (
+  fid integer,
+  name varchar )
+  SERVER myserver
+  OPTIONS ( layer 'pt_two' );
+
+SELECT * FROM pt_2 ORDER BY name;
+
+------------------------------------------------
+
+CREATE FOREIGN TABLE pt_3 (
+  geom bytea,
+  name varchar )
+  SERVER myserver
+  OPTIONS ( layer 'pt_two' );
+
+SELECT * FROM pt_3 ORDER BY name;
+
+------------------------------------------------
+-- Laundering and explicit column naming test
+
+CREATE FOREIGN TABLE column_name_test (
+ fid integer,
+ name varchar OPTIONS (column_name '2ame'),
+ theage integer OPTIONS (column_name 'age'),
+ height real OPTIONS (column_name 'Height'),
+ birthdate date OPTIONS (column_name 'b-rthdate')
+) SERVER myserver
+OPTIONS (layer '2launder');
+
+SELECT * FROM column_name_test ORDER BY fid;
+
+-- Check that columns are reverse-laundered when generating
+-- OGR SQL filters
+SET client_min_messages = debug1;
+SELECT name FROM column_name_test WHERE name = 'Paul';
+SET client_min_messages = notice;
+
+------------------------------------------------
+-- GDAL options passing tests
+
+CREATE SERVER myserver_latin1
+  FOREIGN DATA WRAPPER ogr_fdw
+  OPTIONS (
+    datasource '@abs_srcdir@/data',
+    format 'ESRI Shapefile',
+    config_options 'SHAPE_ENCODING=LATIN1' );
+
+CREATE FOREIGN TABLE e_1 (
+  fid integer,
+  name varchar )
+  SERVER myserver_latin1
+  OPTIONS ( layer 'enc' );
+
+SET client_min_messages = debug1;  
+SELECT * FROM e_1 WHERE fid = 1;
+SET client_min_messages = notice;  
+
+------------------------------------------------
+-- Geometryless test
+
+CREATE SERVER csvserver
+  FOREIGN DATA WRAPPER ogr_fdw
+  OPTIONS (
+    datasource '@abs_srcdir@/data/no_geom.csv',
+    format 'CSV' );
+
+CREATE FOREIGN TABLE no_geom (
+  fid bigint,
+  name varchar,
+  age varchar,
+  value varchar
+) SERVER csvserver
+OPTIONS (layer 'no_geom');
+
+SELECT c.* 
+  FROM generate_series(1,4) g 
+  JOIN no_geom c 
+  ON (c.fid = g.g);
+
+------------------------------------------------
