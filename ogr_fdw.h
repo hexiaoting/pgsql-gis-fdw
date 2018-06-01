@@ -54,10 +54,12 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "funcapi.h"
 
 /* GDAL/OGR includes and compat */
 #include "ogr_fdw_gdal.h"
 #include "ogr_fdw_common.h"
+#include "rt_fdw_common.h"
 
 /* Local configuration defines */
 
@@ -129,59 +131,87 @@ typedef struct OgrConnection
 	OGRLayerH lyr;        /* OGR layer handle */
 } OgrConnection;
 
+typedef struct RasterConnection
+{
+    	char *conf_file;
+	char *location;
+	int rt_file_count; /*total files# */
+	char **rt_files; /*filenames[], size==rt_file_count*/
+	RasterConfig *config;
+	MemoryContext batch_context;
+	MemoryContext temp_context;
+} RasterConnection;
+
 typedef enum
 {
-	OGR_PLAN_STATE,
-	OGR_EXEC_STATE,
-	OGR_MODIFY_STATE
-} OgrFdwStateType;
+	GIS_PLAN_STATE,
+	GIS_EXEC_STATE,
+	GIS_MODIFY_STATE
+} GisFdwStateType;
 
-typedef struct OgrFdwState
+typedef struct GisFdwState
 {
-	OgrFdwStateType type;
+	GisFdwStateType type;
 	Oid foreigntableid;
+	OgrFdwTable *table;
 	OgrConnection ogr;  /* connection object */
-	OgrFdwTable *table;
 	TupleDesc tupdesc;
-} OgrFdwState;
+	bool isRaster;
+	RasterConnection raster;
+} GisFdwState;
 
-typedef struct OgrFdwPlanState
+typedef struct GisFdwPlanState
 {
-	OgrFdwStateType type;
+	GisFdwStateType type;
 	Oid foreigntableid;
-	OgrConnection ogr;
 	OgrFdwTable *table;
+	OgrConnection ogr;  /* connection object */
 	TupleDesc tupdesc;
+	bool isRaster;
+	RasterConnection raster;
 	int nrows;           /* estimate of number of rows in file */
 	Cost startup_cost;
 	Cost total_cost;
 	bool *pushdown_clauses;
-} OgrFdwPlanState;
+} GisFdwPlanState;
 
-typedef struct OgrFdwExecState
+typedef struct GisFdwExecState
 {
-	OgrFdwStateType type;
+	GisFdwStateType type;
 	Oid foreigntableid;
-	OgrConnection ogr;
 	OgrFdwTable *table;
+	OgrConnection ogr;
 	TupleDesc tupdesc;
+	bool isRaster;
+	RasterConnection raster;
+	/*4 items for org*/
 	char *sql;             /* OGR SQL for attribute filter */
 	int rownum;            /* how many rows have we read thus far? */
 	Oid setsridfunc;       /* ST_SetSRID() */
 	Oid typmodsridfunc;    /* postgis_typmod_srid() */
-} OgrFdwExecState;
 
-typedef struct OgrFdwModifyState
+	/*Below items for raster*/
+	int cur_fileno; /*Current Processing file# */
+	int cur_lineno;
+	int next_tuple; /*index of next one tuple to return*/
+	int num_tuples; /* # of tuples in array*/
+	bool eof_curfile_reached; /* true if last raw fetched in current file*/
+	HeapTuple *tuples; /*array of currently-retrieved tuples*/
+	AttInMetadata *attinmeta;
+} GisFdwExecState;
+
+typedef struct GisFdwModifyState
 {
-	OgrFdwStateType type;
+	GisFdwStateType type;
 	Oid foreigntableid;
 	OgrConnection ogr;     /* connection object */
 	OgrFdwTable *table;
 	TupleDesc tupdesc;
-} OgrFdwModifyState;
+	bool isRaster;
+} GisFdwModifyState;
 
 /* Shared function signatures */
-bool ogrDeparse(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel, List *exprs, OgrFdwState *state, List **param);
+bool ogrDeparse(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel, List *exprs, GisFdwState *state, List **param);
 
 
 /* Shared global value of the Geometry OId */

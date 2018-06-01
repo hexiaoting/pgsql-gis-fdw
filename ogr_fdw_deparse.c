@@ -26,7 +26,7 @@ typedef struct OgrDeparseCtx
 	StringInfo buf;           /* output buffer to append to */
 	List **params_list;       /* exprs that will become remote Params */
 	OGRGeometryH geom;        /* if filter contains a geometry constant, it resides here */
-	OgrFdwState *state;       /* to convert local column names to OGR names */
+	GisFdwState *state;       /* to convert local column names to OGR names */
 } OgrDeparseCtx;
 
 /* Local function signatures */
@@ -542,7 +542,7 @@ ogrDeparseExpr(Expr *node, OgrDeparseCtx *context)
 
 
 bool
-ogrDeparse(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel, List *exprs, OgrFdwState *state, List **params)
+ogrDeparse(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel, List *exprs, GisFdwState *state, List **params)
 {
 	OgrDeparseCtx context;
 	ListCell *lc;

@@ -1,7 +1,7 @@
 # ogr_fdw/Makefile
 
 MODULE_big = ogr_fdw
-OBJS = ogr_fdw.o ogr_fdw_deparse.o ogr_fdw_common.o stringbuffer_pg.o
+OBJS = ogr_fdw.o ogr_fdw_deparse.o ogr_fdw_common.o stringbuffer_pg.o rt_fdw_common.o
 EXTENSION = ogr_fdw
 DATA = ogr_fdw--1.0.sql
 
@@ -17,8 +17,12 @@ PG_CONFIG = pg_config
 REGRESS_OPTS = --encoding=UTF8
 
 PG_CPPFLAGS += $(GDAL_CFLAGS)
+
+PG_CONFIG = pg_config
+PG_LIBS = $(shell $(PG_CONFIG) --libdir)
+SHLIB_LINK := -L$(PG_LIBS) -lrtpostgis
 LIBS += $(GDAL_LIBS)
-SHLIB_LINK := $(LIBS)
+SHLIB_LINK += $(LIBS)
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
@@ -39,7 +43,7 @@ endif
 CFLAGS = $(GDAL_CFLAGS)
 LIBS = $(GDAL_LIBS)
 
-ogr_fdw_info$(X): ogr_fdw_info.o ogr_fdw_common.o stringbuffer.o
+ogr_fdw_info$(X): ogr_fdw_info.o ogr_fdw_common.o stringbuffer.o 
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 stringbuffer_pg.o: stringbuffer.c stringbuffer.h

@@ -56,6 +56,7 @@ struct OgrFdwOption
 #define OPT_CONFIG_OPTIONS "config_options"
 #define OPT_OPEN_OPTIONS "open_options"
 #define OPT_UPDATEABLE "updateable"
+#define OPT_RASTER_CONF "conf_file"
 
 #define OGR_FDW_FRMT_INT64	 "%lld"
 #define OGR_FDW_CAST_INT64(x)	 (long long)(x)
@@ -83,6 +84,9 @@ static struct OgrFdwOption valid_options[] = {
 	/* OGR layer options */
 	{OPT_LAYER, ForeignTableRelationId, true, false},
 	{OPT_UPDATEABLE, ForeignTableRelationId, false, false},
+
+	/*RASTER config filename*/
+	{OPT_RASTER_CONF, ForeignTableRelationId, true, false},
 
 	/* EOList marker */
 	{NULL, InvalidOid, false, false}
@@ -117,8 +121,8 @@ static ForeignScan *ogrGetForeignPlan(PlannerInfo *root,
 					,Plan *outer_plan
 #endif
 );
-static void ogrBeginForeignScan(ForeignScanState *node, int eflags);
-static TupleTableSlot *ogrIterateForeignScan(ForeignScanState *node);
+static void gisBeginForeignScan(ForeignScanState *node, int eflags);
+static TupleTableSlot *gisIterateForeignScan(ForeignScanState *node);
 static void ogrReScanForeignScan(ForeignScanState *node);
 static void ogrEndForeignScan(ForeignScanState *node);
 
@@ -149,6 +153,9 @@ static void ogrEndForeignModify (EState *estate,
 					ResultRelInfo *rinfo);
 static int ogrIsForeignRelUpdatable (Relation rel);
 
+static void
+rasterBeginForeignScan(ForeignScanState *node, int eflags, GisFdwExecState *execstate);
+
 
 #if PG_VERSION_NUM >= 90500
 static List *ogrImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid);
@@ -158,8 +165,15 @@ static List *ogrImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid
  * Helper functions
  */
 static OgrConnection ogrGetConnectionFromTable(Oid foreigntableid, bool updateable);
+static RasterConnection rasterGetConnectionFromTable(Oid foreigntableid);
 static void ogr_fdw_exit(int code, Datum arg);
-static void ogrReadColumnData(OgrFdwState *state);
+static void ogrReadColumnData(GisFdwState *state);
+static bool isRaster(Oid foreigntableid);
+static HeapTuple
+make_tuple_from_string(char *str, Relation rel, AttInMetadata *attinmeta,
+        MemoryContext temp_context); 
+static void
+fetch_more_data(ForeignScanState *node, bool nextfile); 
 
 /* Global to hold GEOMETRYOID */
 Oid GEOMETRYOID = InvalidOid;
@@ -201,6 +215,8 @@ _PG_init(void)
 	{
 		GEOMETRYOID = BYTEAOID;
 	}
+	if(putenv("POSTGIS_GDAL_ENABLED_DRIVERS=ENABLE_ALL"))
+	    elog(ERROR, "putenv failed.");
 
 	on_proc_exit(&ogr_fdw_exit, PointerGetDatum(NULL));
 
@@ -234,8 +250,8 @@ ogr_fdw_handler(PG_FUNCTION_ARGS)
 	fdwroutine->GetForeignRelSize = ogrGetForeignRelSize;
 	fdwroutine->GetForeignPaths = ogrGetForeignPaths;
 	fdwroutine->GetForeignPlan = ogrGetForeignPlan;
-	fdwroutine->BeginForeignScan = ogrBeginForeignScan;
-	fdwroutine->IterateForeignScan = ogrIterateForeignScan;
+	fdwroutine->BeginForeignScan = gisBeginForeignScan;
+	fdwroutine->IterateForeignScan = gisIterateForeignScan;
 	fdwroutine->ReScanForeignScan = ogrReScanForeignScan;
 	fdwroutine->EndForeignScan = ogrEndForeignScan;
 
@@ -256,6 +272,57 @@ ogr_fdw_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(fdwroutine);
 }
 
+static
+bool isRaster(Oid foreigntableid)
+{
+	ListCell *cell;
+	ForeignTable *table = GetForeignTable(foreigntableid);
+	ForeignServer *server = GetForeignServer(table->serverid);
+
+	foreach(cell, server->options)
+	{
+		DefElem *def = (DefElem *) lfirst(cell);
+		if (streq(def->defname, OPT_DRIVER)) 
+		{
+			if (streq(defGetString(def), "GTiff"))
+			    return true;
+		}
+	}
+	return false;
+}
+
+static RasterConnection
+rasterGetConnectionFromTable(Oid foreigntableid)
+{
+	ForeignTable *table;
+	ForeignServer *server;
+	ListCell *cell;
+	RasterConnection raster;
+
+	/* Gather all data for the foreign table. */
+	table = GetForeignTable(foreigntableid);
+	server = GetForeignServer(table->serverid);
+
+	/* Null all values */
+	memset(&raster, 0, sizeof(RasterConnection));
+
+	foreach(cell, server->options)
+	{
+		DefElem *def = (DefElem *) lfirst(cell);
+		if (streq(def->defname, OPT_SOURCE))
+			raster.location = defGetString(def);
+	}
+
+	foreach(cell, table->options)
+	{
+		DefElem *def = (DefElem *) lfirst(cell);
+		if (streq(def->defname, OPT_RASTER_CONF))
+			raster.conf_file = defGetString(def);
+	}
+
+	return raster;
+}
+
 /*
  * Given a connection string and (optional) driver string, try to connect
  * with appropriate error handling and reporting. Used in query startup,
@@ -270,6 +337,11 @@ ogrGetDataSource(const char *source, const char *driver, bool updateable,
 	char **open_option_list = NULL;
 #if GDAL_VERSION_MAJOR >= 2
 	unsigned int open_flags = GDAL_OF_VECTOR;
+
+	if ( driver && strcmp(driver,"GTiff") == 0) {
+	    open_flags = GDAL_OF_RASTER;
+	    elog(INFO, "open_flags reset to GDAL_OF_RASTER");
+	}
 
 	if ( updateable )
 		open_flags |= GDAL_OF_UPDATE;
@@ -547,9 +619,10 @@ ogr_fdw_validator(PG_FUNCTION_ARGS)
 	Oid catalog = PG_GETARG_OID(1);
 	ListCell *cell;
 	struct OgrFdwOption *opt;
-	const char *source = NULL, *driver = NULL;
+	const char *source = NULL, *driver = NULL;//, *conf_file = NULL;
 	const char *config_options = NULL, *open_options = NULL;
 	bool updateable = false;
+	bool raster_flag = false;
 
 	/* Check that the database encoding is UTF8, to match OGR internals */
 	if ( GetDatabaseEncoding() != PG_UTF8 )
@@ -591,6 +664,8 @@ ogr_fdw_validator(PG_FUNCTION_ARGS)
 					open_options = defGetString(def);
 				if ( streq(opt->optname, OPT_UPDATEABLE) )
 					updateable = defGetBoolean(def);
+			//	if ( streq(opt->optname, OPT_RASTER_CONF) )
+			//		conf_file = defGetString(def);
 
 				break;
 			}
@@ -621,6 +696,8 @@ ogr_fdw_validator(PG_FUNCTION_ARGS)
 				: errhint("There are no valid options in this context.")));
 		}
 	}
+	if (driver && streq(driver, "GTiff"))
+	    raster_flag = true;
 
 	/* Check that all the mandatory options were found */
 	for ( opt = valid_options; opt->optname; opt++ )
@@ -628,6 +705,8 @@ ogr_fdw_validator(PG_FUNCTION_ARGS)
 		/* Required option for this catalog type is missing? */
 		if ( catalog == opt->optcontext && opt->optrequired && ! opt->optfound )
 		{
+		    if ((raster_flag && streq(opt->optname, OPT_RASTER_CONF)) ||
+			(driver && !streq(driver, "GTiff") && streq(opt->optname, OPT_LAYER)))
 			ereport(ERROR, (
 					errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
 					errmsg("required option \"%s\" is missing", opt->optname)));
@@ -635,7 +714,7 @@ ogr_fdw_validator(PG_FUNCTION_ARGS)
 	}
 
 	/* Make sure server connection can actually be established */
-	if ( catalog == ForeignServerRelationId && source )
+	if ( catalog == ForeignServerRelationId && source && !raster_flag)
 	{
 		OGRDataSourceH ogr_ds;
 		ogr_ds = ogrGetDataSource(source, driver, updateable, config_options, open_options);
@@ -649,28 +728,28 @@ ogr_fdw_validator(PG_FUNCTION_ARGS)
 }
 
 /*
- * Initialize an OgrFdwPlanState on the heap.
+ * Initialize an GisFdwPlanState on the heap.
  */
-static OgrFdwState*
-getOgrFdwState(Oid foreigntableid, OgrFdwStateType state_type)
+static GisFdwState*
+getGisFdwState(Oid foreigntableid, GisFdwStateType state_type)
 {
-	OgrFdwState *state;
+	GisFdwState *state;
 	size_t size;
 	bool updateable = false;
 
 	switch (state_type)
 	{
-		case OGR_PLAN_STATE:
-			size = sizeof(OgrFdwPlanState);
+		case GIS_PLAN_STATE:
+			size = sizeof(GisFdwPlanState);
 			updateable = false;
 			break;
-		case OGR_EXEC_STATE:
-			size = sizeof(OgrFdwExecState);
+		case GIS_EXEC_STATE:
+			size = sizeof(GisFdwExecState);
 			updateable = false;
 			break;
-		case OGR_MODIFY_STATE:
+		case GIS_MODIFY_STATE:
 			updateable = true;
-			size = sizeof(OgrFdwModifyState);
+			size = sizeof(GisFdwModifyState);
 			break;
 		default:
 			elog(ERROR, "invalid state type");
@@ -680,7 +759,13 @@ getOgrFdwState(Oid foreigntableid, OgrFdwStateType state_type)
 	state->type = state_type;
 
 	/*  Connect! */
-	state->ogr = ogrGetConnectionFromTable(foreigntableid, updateable);
+	if (isRaster(foreigntableid)) {
+	    state->isRaster = true;
+	    if (state_type == GIS_EXEC_STATE)
+	    	state->raster = rasterGetConnectionFromTable(foreigntableid);
+	} else {
+	    state->ogr = ogrGetConnectionFromTable(foreigntableid, updateable);
+	}
 	state->foreigntableid = foreigntableid;
 
 	return state;
@@ -698,10 +783,15 @@ ogrGetForeignRelSize(PlannerInfo *root,
                      Oid foreigntableid)
 {
 	/* Initialize the OGR connection */
-	OgrFdwState *state = (OgrFdwState *)getOgrFdwState(foreigntableid, OGR_PLAN_STATE);
-	OgrFdwPlanState *planstate = (OgrFdwPlanState *)state;
+	GisFdwState *state = (GisFdwState *)getGisFdwState(foreigntableid, GIS_PLAN_STATE);
+	GisFdwPlanState *planstate = (GisFdwPlanState *)state;
 	List *scan_clauses = baserel->baserestrictinfo;
 
+	if (planstate->isRaster)
+	{
+	    baserel->fdw_private = (void *) planstate;
+	    return;
+	}
 	/* Set to NULL to clear the restriction clauses in OGR */
 	OGR_L_SetIgnoredFields(planstate->ogr.lyr, NULL);
 	OGR_L_SetSpatialFilter(planstate->ogr.lyr, NULL);
@@ -758,7 +848,7 @@ ogrGetForeignPaths(PlannerInfo *root,
                    RelOptInfo *baserel,
                    Oid foreigntableid)
 {
-	OgrFdwPlanState *planstate = (OgrFdwPlanState *)(baserel->fdw_private);
+	GisFdwPlanState *planstate = (GisFdwPlanState *)(baserel->fdw_private);
 
 	/* TODO: replace this with something that looks at the OGRDriver and */
 	/* makes a determination based on that? Better: add connection caching */
@@ -815,50 +905,54 @@ ogrGetForeignPlan(PlannerInfo *root,
 	StringInfoData sql;
 	List *params_list = NULL;
 	List *fdw_private;
-	OgrFdwPlanState *planstate = (OgrFdwPlanState *)(baserel->fdw_private);
-	OgrFdwState *state = (OgrFdwState *)(baserel->fdw_private);
+	GisFdwPlanState *planstate = (GisFdwPlanState *)(baserel->fdw_private);
+	GisFdwState *state = (GisFdwState *)(baserel->fdw_private);
 
-	/* Add in column mapping data to build SQL with the right OGR column names */
-	ogrReadColumnData(state);
+	if (planstate->isRaster) {
+	    scan_clauses = extract_actual_clauses(scan_clauses, false);
+	} else {
+	    /* Add in column mapping data to build SQL with the right OGR column names */
+	    ogrReadColumnData(state);
 
-	/*
-	 * TODO: Review the columns requested (via params_list) and only pull those back, using
-	 * OGR_L_SetIgnoredFields. This is less important than pushing restrictions
-	 * down to OGR via OGR_L_SetAttributeFilter (done) and (TODO) OGR_L_SetSpatialFilter.
-	 */
-	initStringInfo(&sql);
-	sql_generated = ogrDeparse(&sql, root, baserel, scan_clauses, state, &params_list);
-	elog(DEBUG1,"OGR SQL: %s", sql.data);
+	    /*
+	     * TODO: Review the columns requested (via params_list) and only pull those back, using
+	     * OGR_L_SetIgnoredFields. This is less important than pushing restrictions
+	     * down to OGR via OGR_L_SetAttributeFilter (done) and (TODO) OGR_L_SetSpatialFilter.
+	     */
+	    initStringInfo(&sql);
+	    sql_generated = ogrDeparse(&sql, root, baserel, scan_clauses, state, &params_list);
+	    elog(DEBUG1,"OGR SQL: %s", sql.data);
 
-	/*
-	 * Here we strip RestrictInfo
-	 * nodes from the clauses and ignore pseudoconstants (which will be
-	 * handled elsewhere).
-	 * Some FDW implementations (mysql_fdw) just pass this full list on to the
-	 * make_foreignscan function. postgres_fdw carefully separates local and remote
-	 * clauses and only passes the local ones to make_foreignscan, so this
-	 * is probably best practice, though re-applying the clauses is probably
-	 * the least of our performance worries with this fdw. For now, we just
-	 * pass them all to make_foreignscan, see no evil, etc.
-	 */
-	scan_clauses = extract_actual_clauses(scan_clauses, false);
+	    /*
+	     * Here we strip RestrictInfo
+	     * nodes from the clauses and ignore pseudoconstants (which will be
+	     * handled elsewhere).
+	     * Some FDW implementations (mysql_fdw) just pass this full list on to the
+	     * make_foreignscan function. postgres_fdw carefully separates local and remote
+	     * clauses and only passes the local ones to make_foreignscan, so this
+	     * is probably best practice, though re-applying the clauses is probably
+	     * the least of our performance worries with this fdw. For now, we just
+	     * pass them all to make_foreignscan, see no evil, etc.
+	     */
+	    scan_clauses = extract_actual_clauses(scan_clauses, false);
 
-	/*
-	 * Serialize the data we want to pass to the execution stage.
-	 * This is ugly but seems to be the only way to pass our constructed
-	 * OGR SQL command to execution.
-	 *
-	 * TODO: Pass a spatial filter down also.
-	 */
-	if ( sql_generated )
+	    /*
+	     * Serialize the data we want to pass to the execution stage.
+	     * This is ugly but seems to be the only way to pass our constructed
+	     * OGR SQL command to execution.
+	     *
+	     * TODO: Pass a spatial filter down also.
+	     */
+	    if ( sql_generated )
 		fdw_private = list_make2(makeString(sql.data), params_list);
-	else
+	    else
 		fdw_private = list_make2(NULL, params_list);
 
-	/*
-	 * Clean up our connection
-	 */
-	ogrFinishConnection(&(planstate->ogr));
+	    /*
+	     * Clean up our connection
+	     */
+	    ogrFinishConnection(&(planstate->ogr));
+	}
 
 	/* Create the ForeignScan node */
 	return make_foreignscan(tlist,
@@ -1062,7 +1156,7 @@ static int ogrFieldEntryCmpFunc(const void * a, const void * b)
  * returns.
  */
 static void
-ogrReadColumnData(OgrFdwState *state)
+ogrReadColumnData(GisFdwState *state)
 {
 	Relation rel;
 	TupleDesc tupdesc;
@@ -1282,55 +1376,60 @@ ogrLookupGeometryFunctionOid(const char *proname)
 	return InvalidOid;
 }
 
+
 /*
- * ogrBeginForeignScan
+ * gisBeginForeignScan
  */
 static void
-ogrBeginForeignScan(ForeignScanState *node, int eflags)
+gisBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	Oid foreigntableid = RelationGetRelid(node->ss.ss_currentRelation);
 	ForeignScan *fsplan = (ForeignScan *)node->ss.ps.plan;
 
 	/* Initialize OGR connection */
-	OgrFdwState *state = getOgrFdwState(foreigntableid, OGR_EXEC_STATE);
-	OgrFdwExecState *execstate = (OgrFdwExecState *)state;
+	GisFdwState *state = getGisFdwState(foreigntableid, GIS_EXEC_STATE);
+	GisFdwExecState *execstate = (GisFdwExecState *)state;
 
-	/* Read the OGR layer definition and PgSQL foreign table definitions */
-	ogrReadColumnData(state);
+	if (state->isRaster) {
+	    rasterBeginForeignScan(node, eflags, execstate);
+	} else {
+	    /* Read the OGR layer definition and PgSQL foreign table definitions */
+	    ogrReadColumnData(state);
 
-	/* Collect the procedure Oids for PostGIS functions we might need */
-	execstate->setsridfunc = ogrLookupGeometryFunctionOid("st_setsrid");
-	execstate->typmodsridfunc = ogrLookupGeometryFunctionOid("postgis_typmod_srid");
+	    /* Collect the procedure Oids for PostGIS functions we might need */
+	    execstate->setsridfunc = ogrLookupGeometryFunctionOid("st_setsrid");
+	    execstate->typmodsridfunc = ogrLookupGeometryFunctionOid("postgis_typmod_srid");
 
-	/* Get private info created by planner functions. */
-	execstate->sql = strVal(list_nth(fsplan->fdw_private, 0));
-	// execstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private, 1);
+	    /* Get private info created by planner functions. */
+	    execstate->sql = strVal(list_nth(fsplan->fdw_private, 0));
+	    // execstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private, 1);
 
-	if ( execstate->sql && strlen(execstate->sql) > 0 )
-	{
+	    if ( execstate->sql && strlen(execstate->sql) > 0 )
+	    {
 		OGRErr err = OGR_L_SetAttributeFilter(execstate->ogr.lyr, execstate->sql);
 		if ( err != OGRERR_NONE )
 		{
-			const char *ogrerr = CPLGetLastErrorMsg();
+		    const char *ogrerr = CPLGetLastErrorMsg();
 
-			if ( ogrerr && ! streq(ogrerr,"") )
-			{
-				ereport(NOTICE,
-					(errcode(ERRCODE_FDW_ERROR),
-					 errmsg("unable to set OGR SQL '%s' on layer", execstate->sql),
-					 errhint("%s", ogrerr)));
-			}
-			else
-			{
-				ereport(NOTICE,
-					(errcode(ERRCODE_FDW_ERROR),
-					 errmsg("unable to set OGR SQL '%s' on layer", execstate->sql)));
-			}
+		    if ( ogrerr && ! streq(ogrerr,"") )
+		    {
+			ereport(NOTICE,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("unable to set OGR SQL '%s' on layer", execstate->sql),
+				 errhint("%s", ogrerr)));
+		    }
+		    else
+		    {
+			ereport(NOTICE,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("unable to set OGR SQL '%s' on layer", execstate->sql)));
+		    }
 		}
-	}
-	else
-	{
+	    }
+	    else
+	    {
 		OGR_L_SetAttributeFilter(execstate->ogr.lyr, NULL);
+	    }
 	}
 
 	/* Save the state for the next call */
@@ -1366,7 +1465,7 @@ ogrNullSlot(Datum *values, bool *nulls, int i)
 }
 
 /*
-* The ogrIterateForeignScan is getting a new TupleTableSlot to handle
+* The gisIterateForeignScan is getting a new TupleTableSlot to handle
 * for each iteration. Each slot contains an entry for every column in
 * in the foreign table, that has to be filled out, either with a value
 * or a NULL for columns that either have been deleted or were not requested
@@ -1380,7 +1479,7 @@ ogrNullSlot(Datum *values, bool *nulls, int i)
 * the type, then everything else.
 */
 static OGRErr
-ogrFeatureToSlot(const OGRFeatureH feat, TupleTableSlot *slot, const OgrFdwExecState *execstate)
+ogrFeatureToSlot(const OGRFeatureH feat, TupleTableSlot *slot, const GisFdwExecState *execstate)
 {
 	const OgrFdwTable *tbl = execstate->table;
 	int i;
@@ -1993,40 +2092,80 @@ ogrSlotToFeature(const TupleTableSlot *slot, OGRFeatureH feat, const OgrFdwTable
 }
 
 /*
- * ogrIterateForeignScan
+ * gisIterateForeignScan
  *		Read next record from OGR and store it into the
  *		ScanTupleSlot as a virtual tuple
  */
 static TupleTableSlot *
-ogrIterateForeignScan(ForeignScanState *node)
+gisIterateForeignScan(ForeignScanState *node)
 {
-	OgrFdwExecState *execstate = (OgrFdwExecState *) node->fdw_state;
+	GisFdwExecState *execstate = (GisFdwExecState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	OGRFeatureH feat;
 
-	/*
-	 * Clear the slot. If it gets through w/o being filled up, that means
-	 * we're all done.
-	 */
-	ExecClearTuple(slot);
+	if (execstate->isRaster) {
+	    if(execstate->raster.rt_file_count == 0)
+		return ExecClearTuple(slot);
 
-	/*
-	 * First time through, reset reading. Then keep reading until
-	 * we run out of records, then return a cleared (NULL) slot, to
-	 * notify the core we're done.
-	 */
-	if ( execstate->rownum == 0 )
-	{
+	    /*
+	     * S1: Read tuple from buffer(execstate->raster.tuples),
+	     *      if Current state->tuples buffer is consumed. Then goto S2
+	     * S2: Get more data from current file
+	     *      if Get Some ,then read from current state->tuples
+	     *      else: goto S3
+	     * S3: Get data from next file
+	     *      if Get some, then read from state->tuples
+	     *      else(all files data is alrady iterated): goto S4
+	     * S4: return null
+	     */
+	    if (execstate->next_tuple >= execstate->num_tuples)
+	    {
+		execstate->num_tuples = 0;
+		// Read current file
+		if (!execstate->eof_curfile_reached && execstate->raster.rt_file_count) {
+		    //elog(INFO, "read current file %s", state->rt_files[state->cur_fileno]);
+		    fetch_more_data(node, false);
+		}
+
+		// If current file is already eof, then Read next file
+		if (execstate->num_tuples == 0 && execstate->eof_curfile_reached) {
+		    if (execstate->cur_fileno < execstate->raster.rt_file_count - 1) {
+			//elog(INFO, "current file eof, read another %s", state->rt_files[state->cur_fileno + 1]);
+			fetch_more_data(node, true);
+		    } else {
+			return ExecClearTuple(slot);
+		    }
+		}
+	    }
+
+	    ExecStoreTuple(execstate->tuples[execstate->next_tuple++],
+		    slot,
+		    InvalidBuffer,
+		    false);
+	} else {
+	    /*
+	     * Clear the slot. If it gets through w/o being filled up, that means
+	     * we're all done.
+	     */
+	    ExecClearTuple(slot);
+
+	    /*
+	     * First time through, reset reading. Then keep reading until
+	     * we run out of records, then return a cleared (NULL) slot, to
+	     * notify the core we're done.
+	     */
+	    if ( execstate->rownum == 0 )
+	    {
 		OGR_L_ResetReading(execstate->ogr.lyr);
-	}
+	    }
 
-	/* If we rectreive a feature from OGR, copy it over into the slot */
-	feat = OGR_L_GetNextFeature(execstate->ogr.lyr);
-	if ( feat )
-	{
+	    /* If we rectreive a feature from OGR, copy it over into the slot */
+	    feat = OGR_L_GetNextFeature(execstate->ogr.lyr);
+	    if ( feat )
+	    {
 		/* convert result to arrays of values and null indicators */
 		if ( OGRERR_NONE != ogrFeatureToSlot(feat, slot, execstate) )
-			ogrEreportError("failure reading OGR data source");
+		    ogrEreportError("failure reading OGR data source");
 
 		/* store the virtual tuple */
 		ExecStoreVirtualTuple(slot);
@@ -2036,6 +2175,7 @@ ogrIterateForeignScan(ForeignScanState *node)
 
 		/* Release OGR feature object */
 		OGR_F_Destroy(feat);
+	    }
 	}
 
 	return slot;
@@ -2048,7 +2188,7 @@ ogrIterateForeignScan(ForeignScanState *node)
 static void
 ogrReScanForeignScan(ForeignScanState *node)
 {
-	OgrFdwExecState *execstate = (OgrFdwExecState *) node->fdw_state;
+	GisFdwExecState *execstate = (GisFdwExecState *) node->fdw_state;
 
 	OGR_L_ResetReading(execstate->ogr.lyr);
 	execstate->rownum = 0;
@@ -2063,7 +2203,7 @@ ogrReScanForeignScan(ForeignScanState *node)
 static void
 ogrEndForeignScan(ForeignScanState *node)
 {
-	OgrFdwExecState *execstate = (OgrFdwExecState *) node->fdw_state;
+	GisFdwExecState *execstate = (GisFdwExecState *) node->fdw_state;
 
 	elog(DEBUG2, "processed %d rows from OGR", execstate->rownum);
 
@@ -2188,12 +2328,12 @@ static void ogrBeginForeignModify (ModifyTableState *mtstate,
 					int eflags)
 {
 	Oid foreigntableid;
-	OgrFdwState *state;
+	GisFdwState *state;
 
 	elog(DEBUG2, "ogrBeginForeignModify");
 
 	foreigntableid = RelationGetRelid(rinfo->ri_RelationDesc);
-	state = getOgrFdwState(foreigntableid, OGR_MODIFY_STATE);
+	state = getGisFdwState(foreigntableid, GIS_MODIFY_STATE);
 
 	/* Read the OGR layer definition and PgSQL foreign table definitions */
 	ogrReadColumnData(state);
@@ -2213,7 +2353,7 @@ static TupleTableSlot *ogrExecForeignUpdate (EState *estate,
 					TupleTableSlot *slot,
 					TupleTableSlot *planSlot)
 {
-	OgrFdwModifyState *modstate = rinfo->ri_FdwState;
+	GisFdwModifyState *modstate = rinfo->ri_FdwState;
 	TupleDesc td = slot->tts_tupleDescriptor;
 	Relation rel = rinfo->ri_RelationDesc;
 	Oid foreigntableid = RelationGetRelid(rel);
@@ -2372,7 +2512,7 @@ static TupleTableSlot *ogrExecForeignInsert (EState *estate,
 					TupleTableSlot *slot,
 					TupleTableSlot *planSlot)
 {
-	OgrFdwModifyState *modstate = rinfo->ri_FdwState;
+	GisFdwModifyState *modstate = rinfo->ri_FdwState;
 	OGRFeatureDefnH ogr_fd = OGR_L_GetLayerDefn(modstate->ogr.lyr);
 	OGRFeatureH feat = OGR_F_Create(ogr_fd);
 	TupleDesc td = slot->tts_tupleDescriptor;
@@ -2416,7 +2556,7 @@ static TupleTableSlot *ogrExecForeignDelete (EState *estate,
 					TupleTableSlot *slot,
 					TupleTableSlot *planSlot)
 {
-	OgrFdwModifyState *modstate = rinfo->ri_FdwState;
+	GisFdwModifyState *modstate = rinfo->ri_FdwState;
 	TupleDesc td = planSlot->tts_tupleDescriptor;
 	Relation rel = rinfo->ri_RelationDesc;
 	Oid foreigntableid = RelationGetRelid(rel);
@@ -2457,7 +2597,7 @@ static TupleTableSlot *ogrExecForeignDelete (EState *estate,
 
 static void ogrEndForeignModify (EState *estate, ResultRelInfo *rinfo)
 {
-	OgrFdwModifyState *modstate = rinfo->ri_FdwState;
+	GisFdwModifyState *modstate = rinfo->ri_FdwState;
 
 	elog(DEBUG2, "ogrEndForeignModify");
 
@@ -2634,6 +2774,186 @@ ogrImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	ogrFinishConnection(&ogr);
 
 	return commands;
+}
+
+static void
+rasterBeginForeignScan(ForeignScanState *node, int eflags, GisFdwExecState *execstate)
+{
+    RasterConfig *config;
+    struct stat s_buf;
+    char *location;
+    EState *estate = node->ss.ps.state;
+    RasterConnection *conn = &(execstate->raster);
+
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+        return;
+    /*
+     * Set variables for conn
+     */
+    execstate->attinmeta = TupleDescGetAttInMetadata(RelationGetDescr(node->ss.ss_currentRelation));
+    conn->batch_context = AllocSetContextCreate(estate->es_query_cxt,
+            "rasterdb_fdw temporary data",
+            ALLOCSET_DEFAULT_MINSIZE,
+            ALLOCSET_DEFAULT_INITSIZE,
+            ALLOCSET_DEFAULT_MAXSIZE);
+    conn->temp_context = AllocSetContextCreate(estate->es_query_cxt,
+            "rasterdb_fdw temporary data",
+            ALLOCSET_SMALL_MINSIZE,
+            ALLOCSET_SMALL_INITSIZE,
+            ALLOCSET_SMALL_MAXSIZE);
+
+    //Set raster files
+    set_raster_config(&(conn->config), conn->conf_file);
+    config = conn->config;
+    location = conn->location;
+    stat(location, &s_buf);
+
+    GDALAllRegister();
+    //check that GDAL recognizes all files
+    if(S_ISREG(s_buf.st_mode)) {
+        if (GDALIdentifyDriver(location, NULL) == NULL) {
+            elog(INFO, "Unable to read raster file: %s", location);
+        }
+        conn->rt_files = (char **) rtrealloc(conn->rt_files, sizeof(char *) * (1 + conn->rt_file_count));
+        if (conn->rt_files == NULL) {
+            rtdealloc_config(config);
+            elog(ERROR, "Could not allocate memory for storing raster files");
+        }
+
+        conn->rt_files[conn->rt_file_count] = rtalloc(sizeof(char) * (strlen(location) + 1));
+	if (conn->rt_files[conn->rt_file_count] == NULL) {
+	    rtdealloc_config(config);
+	    elog(ERROR, "Could not allocate memory for storing raster filename");
+	}
+	strcpy(conn->rt_files[conn->rt_file_count], location);
+	conn->rt_file_count++;
+    } else if (S_ISDIR(s_buf.st_mode)) {
+	int tmp_length= 0;
+	char filename[FILENAME_MAXSIZE];
+	DIR *dir;
+	struct dirent *entry;
+	memset(filename, 0, 50);
+	if ((dir = opendir(location)) != NULL) {
+	    // print all the files and directories within directory
+	    while ((entry = readdir(dir)) != NULL) {
+		if (entry->d_type != DT_REG && entry->d_type != DT_UNKNOWN) {
+		    elog(DEBUG1, "Do not support %s type %d", entry->d_name, entry->d_type);
+		    continue;
+		}
+		tmp_length = strlen(location) + strlen(entry->d_name) + 2;
+		snprintf(filename,
+			tmp_length,
+			"%s/%s",
+			location,
+			entry->d_name);
+		if (GDALIdentifyDriver(filename, NULL) == NULL) {
+		    elog(INFO, "GDAL identify raster failed:%s", filename);
+		    continue;
+		}
+		conn->rt_files = (char **) rtrealloc(conn->rt_files, sizeof(char *) * (1 + conn->rt_file_count));
+		if (conn->rt_files == NULL) {
+		    rtdealloc_config(config);
+		    elog(ERROR, "Could not allocate memory for storing raster files");
+		}
+
+		conn->rt_files[conn->rt_file_count] = rtalloc(sizeof(char) * (tmp_length + 1));
+		if (conn->rt_files[conn->rt_file_count] == NULL) {
+		    rtdealloc_config(config);
+		    elog(ERROR, "Could not allocate memory for storing raster filename");
+		}
+		strcpy(conn->rt_files[conn->rt_file_count],
+			filename);
+		conn->rt_file_count++;
+		//elog(INFO, "add file %s", filename);
+	    }
+	    if(closedir(dir) == -1) {
+		elog(ERROR, "closedir failed. errno=%d ", errno);
+	    }
+	} else {
+	    elog(ERROR, "Cannot open dir:%s", location);
+	}
+    } else {
+	elog(ERROR, "Location(%s) is not a file or directory !", location);
+    }
+
+    /*no file find in config location*/
+    if (conn->rt_file_count == 0) {
+	elog(INFO, "No file added to conn->rt_files");
+    }
+}
+
+static void
+fetch_more_data(ForeignScanState *node, bool nextfile) {
+    GisFdwExecState *state = (GisFdwExecState*) node->fdw_state;
+    AttInMetadata *attinmeta = state->attinmeta;
+    int batchsize = state->raster.config->batchsize;
+    int numrows = 0; // fetched rasterdb rows
+    int i = 0;
+    char **buf = NULL;
+    MemoryContext oldcontext;
+    char *filename;
+
+    state->tuples = NULL;
+
+    MemoryContextReset(state->raster.batch_context);
+    oldcontext = MemoryContextSwitchTo(state->raster.batch_context);
+
+    buf = palloc0(sizeof(char *) * batchsize);
+    if(nextfile) {
+        state->cur_lineno = 0;
+        state->cur_fileno++;
+    }
+    filename = state->raster.rt_files[state->cur_fileno];
+    elog(DEBUG1, "Processing file:%s", filename);
+
+    numrows = analysis_raster(filename, state->raster.config, state->cur_lineno, buf);
+
+    state->tuples = (HeapTuple *)palloc0(numrows * sizeof(HeapTuple));
+    for (i = 0; i < numrows; i++) {
+        state->tuples[i] =
+            make_tuple_from_string(buf[i], node->ss.ss_currentRelation,
+                    attinmeta,
+                    state->raster.temp_context);
+    }
+
+    pfree(buf);
+
+    state->cur_lineno += numrows;
+    state->next_tuple = 0;
+    state->num_tuples = numrows;
+    state->eof_curfile_reached = (numrows < batchsize);
+
+    MemoryContextSwitchTo(oldcontext);
+}
+
+static HeapTuple
+make_tuple_from_string(char *str, Relation rel, AttInMetadata *attinmeta,
+        MemoryContext temp_context) {
+    HeapTuple tuple;
+    TupleDesc tupledesc = RelationGetDescr(rel);
+    Datum *values;
+    bool *nulls;
+    MemoryContext oldcontext;
+
+    Assert(tupledesc->nattrs = 1);
+
+    oldcontext = MemoryContextSwitchTo(temp_context);
+
+    values = (Datum *) palloc0(tupledesc->natts * sizeof(Datum));
+    nulls = (bool *) palloc0(tupledesc->natts * sizeof(bool));
+    memset(nulls, true, tupledesc->natts * sizeof(bool));
+    nulls[0] = (str == NULL);
+    values[0] = InputFunctionCall(&attinmeta->attinfuncs[0],
+            str,
+            attinmeta->attioparams[0],
+            attinmeta->atttypmods[0]
+            );
+
+    MemoryContextSwitchTo(oldcontext);
+    tuple = heap_form_tuple(tupledesc, values, nulls);
+    MemoryContextReset(temp_context);
+
+    return tuple;
 }
 
 #endif /* PostgreSQL 9.5+ */

@@ -11,6 +11,7 @@
 
 /* getopt */
 #include <unistd.h>
+#include <stdbool.h>
 
 /*
  * OGR library API
@@ -21,6 +22,7 @@
 static void usage();
 static OGRErr ogrListLayers(const char *source);
 static OGRErr ogrGenerateSQL(const char *source, const char *layer);
+static OGRErr rasterGenerateSQL(const char *source, const char *conf);
 
 #define STR_MAX_LEN 256
 
@@ -59,7 +61,8 @@ formats()
 		createable = GDALDatasetTestCapability(ogr_dr, ODrCCreateDataSource);
 #endif
 		/* Skip raster data sources */
-		if ( ! vector ) continue;
+		if ( ! vector &&  strcmp(GDALGetDriverShortName(ogr_dr), "GTiff")) 
+		    	continue;
 
 		/* Report sources w/ create capability as r/w */
 		if( createable )
@@ -77,8 +80,9 @@ static void
 usage()
 {
 	printf(
-		"usage: ogr_fdw_info -s <ogr datasource> -l <ogr layer>\n"
+		"usage:    ogr_fdw_info -s <ogr datasource> -l <ogr layer>\n"
 		"	   ogr_fdw_info -s <ogr datasource>\n"
+		"	   ogr_fdw_info -s <raster datasource> -c <raster conf_file> -r\n"
 		"	   ogr_fdw_info -f\n"
 		"\n");
 	exit(0);
@@ -90,15 +94,23 @@ main (int argc, char **argv)
 	int ch;
 	char *source = NULL, *layer = NULL;
 	OGRErr err = OGRERR_NONE;
+	char *conf = NULL;
+	bool raster_flag = false;
 
 	/* If no options are specified, display usage */
 	if (argc == 1)
 		usage();
 
-	while ((ch = getopt(argc, argv, "h?s:l:f")) != -1) {
+	while ((ch = getopt(argc, argv, "h?rs:l:fc:")) != -1) {
 		switch (ch) {
 			case 's':
 				source = optarg;
+				break;
+			case 'r':
+				raster_flag = true;
+				break;
+			case 'c':
+				conf = optarg;
 				break;
 			case 'l':
 				layer = optarg;
@@ -114,9 +126,13 @@ main (int argc, char **argv)
 		}
 	}
 
-	if ( source && ! layer )
+	if ( source && ! layer && ! raster_flag)
 	{
 		err = ogrListLayers(source);
+	}
+	else if ( source && raster_flag && conf)
+	{
+		err = rasterGenerateSQL(source, conf);
 	}
 	else if ( source && layer )
 	{
@@ -141,6 +157,8 @@ ogrListLayers(const char *source)
 {
 	GDALDatasetH ogr_ds = NULL;
 	int i;
+	bool is_raster = false;
+	GDALDriverH ogr_dr = NULL;
 
 	GDALAllRegister();
 
@@ -148,25 +166,34 @@ ogrListLayers(const char *source)
 	ogr_ds = OGROpen(source, FALSE, NULL);
 #else
 	ogr_ds = GDALOpenEx(source,
-						GDAL_OF_VECTOR|GDAL_OF_READONLY,
+						GDAL_OF_READONLY,
+						//GDAL_OF_VECTOR|GDAL_OF_READONLY,
 						NULL, NULL, NULL);
 #endif
 
+	ogr_dr = GDALGetDatasetDriver(ogr_ds);
+	if (strcmp(GDALGetDriverShortName(ogr_dr), "GTiff") == 0)
+	    is_raster = true;
+
 	if ( ! ogr_ds )
 	{
-		CPLError(CE_Failure, CPLE_AppDefined, "Could not connect to source '%s'", source);
-		return OGRERR_FAILURE;
+	    CPLError(CE_Failure, CPLE_AppDefined, "Could not connect to source '%s'", source);
+	    return OGRERR_FAILURE;
 	}
 
-	printf("Layers:\n");
-	for ( i = 0; i < GDALDatasetGetLayerCount(ogr_ds); i++ )
-	{
+	if (!is_raster) {
+	    printf("Layers:\n");
+	    for ( i = 0; i < GDALDatasetGetLayerCount(ogr_ds); i++ )
+	    {
 		OGRLayerH ogr_lyr = GDALDatasetGetLayer(ogr_ds, i);
 		if ( ! ogr_lyr )
 		{
-			return OGRERR_FAILURE;
+		    return OGRERR_FAILURE;
 		}
 		printf("  %s\n", OGR_L_GetName(ogr_lyr));
+	    }
+	} else {
+	    printf("This is a raster GTiff file, Please specify a conf_file with -c");
 	}
 	printf("\n");
 
@@ -242,3 +269,30 @@ ogrGenerateSQL(const char *source, const char *layer)
 	return OGRERR_NONE;
 }
 
+static OGRErr
+rasterGenerateSQL(const char *source, const char *conf)
+{
+	char server_name[STR_MAX_LEN];
+	char table_name[STR_MAX_LEN];
+
+	/* There should be a nicer way to do this */
+	strcpy(server_name, "myserver");
+	strcpy(table_name, "mytable");
+
+	/* Output SERVER definition */
+	printf("\nCREATE SERVER %s\n"
+		"  FOREIGN DATA WRAPPER ogr_fdw\n"
+		"  OPTIONS (\n"
+		"	datasource '%s',\n"
+		"	format 'GTiff' );\n",
+		server_name, source);//, GDALGetDriverShortName(rt_dr));
+
+	//create foreign table raster_test (rast raster) server rasterServer options(conf_file '/home/hewenting/casearth/rasterdb/etc/rasterdb.conf'
+	printf("\nCREATE FOREIGN TABLE %s(rast raster)\n"
+		"  SERVER %s\n"
+		"  OPTIONS (\n"
+		"	conf_file '%s' );\n",
+		table_name, server_name, conf);
+
+	return OGRERR_NONE;
+}

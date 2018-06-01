@@ -1,0 +1,24 @@
+CREATE EXTENSION postgis;
+CREATE EXTENSION ogr_fdw;
+
+CREATE SERVER gtiffserver
+  FOREIGN DATA WRAPPER ogr_fdw
+  OPTIONS (
+    datasource '@abs_srcdir@/data/gtiff',
+    format 'GTiff' );
+
+------------------------------------------------
+
+CREATE FOREIGN TABLE mytable (
+  rast raster)
+  SERVER gtiffserver
+  OPTIONS (conf_file '@abs_srcdir@/conf/raster.conf' );
+
+----------------------------------------------------------------------
+
+SELECT COUNT(*) FROM mytable;
+
+----------------------------------------------------------------------
+
+SELECT ST_value(rast, 1, 2, 3) from mytable;
+
